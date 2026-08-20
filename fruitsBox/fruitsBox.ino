@@ -14,12 +14,14 @@
 const uint8_t LCD_COLS = 20;
 const uint8_t LCD_ROWS = 4;
 
-// The DHT needs 2s between reads; polling faster returns stale values.
+// Poll as fast as the fitted sensor is specified to sample: the DHT11 is rated
+// at 1 Hz, the DHT22 at 0.5 Hz. Tied to DHTTYPE so swapping the sensor cannot
+// leave the Nano reading a DHT22 twice as fast as its datasheet allows.
+#if DHTTYPE == DHT11
+const unsigned long READ_INTERVAL_MS = 1000;
+#else
 const unsigned long READ_INTERVAL_MS = 2000;
-
-// Top of the DHT11's usable humidity range. Past this the sensor saturates
-// and flatlines instead of erroring, so the reading needs a visible caveat.
-const float RH_SENSOR_LIMIT = 90.0;
+#endif
 
 DHT dht(DHTPIN, DHTTYPE);
 LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
@@ -28,6 +30,8 @@ unsigned long lastClockTick = 0;
 
 // Writes text at the start of a row and blanks the rest of it, so a shorter
 // reading never leaves digits behind from a longer one (100.0 -> 61.0).
+// Keep every string plain ASCII below 0x5B: the HD44780's stock A00 character
+// ROM stops matching ASCII above that, and prints a yen sign for a backslash.
 void lcdPrintLine(uint8_t row, const char *text) {
   lcd.setCursor(0, row);
   uint8_t col = 0;
@@ -41,8 +45,9 @@ void lcdPrintLine(uint8_t row, const char *text) {
   }
 }
 
-// Header row: title on the left, running uptime on the right. Knowing how long
-// the board has been up tells you whether a frozen reading is stale or current.
+// Header row: title on the left, running uptime on the right. The clock is the
+// only liveness cue left on screen -- if it ticks, the board is alive, so a
+// steady temperature is a steady box rather than a crash.
 void lcdPrintHeader() {
   unsigned long seconds = millis() / 1000UL;
   char uptime[9];
@@ -73,9 +78,13 @@ void setup() {
   lcdPrintLine(0, "Fruit Box");
   lcdPrintLine(1, "Temp:   --.- " "\xDF" "C");
   lcdPrintLine(2, "Hum :   --.- %");
-  lcdPrintLine(3, "Starting up...");
+  lcdPrintLine(3, "");  // left blank on purpose; nothing else belongs on screen
 
   Serial.println(F("Fruit box climate monitor"));
+  // Compiler-stamped, so the serial log always identifies which binary is
+  // actually on the board -- a stale flash otherwise looks like a code bug.
+  Serial.print(F("build "));
+  Serial.println(F(__DATE__ " " __TIME__));
   Serial.println(F("-------------------------"));
 
   // First read after begin() is often NaN; burn it so the log starts clean.
@@ -95,19 +104,29 @@ void loop() {
   if (millis() - lastRead < READ_INTERVAL_MS) {
     return;
   }
-  lastRead = millis();
 
-  float humidity = dht.readHumidity();
+  // force=true skips the library's blanket 2 s frame cache (MIN_INTERVAL in
+  // DHT.cpp), which is sized for the slower DHT22; without it a 1 s poll would
+  // silently hand back the previous frame and the display would look frozen.
+  // The temperature getter is deliberately left unforced so it reuses that same
+  // frame -- forcing it too would read the sensor twice and risk the two halves
+  // of one on-screen row coming from different moments.
+  float humidity = dht.readHumidity(true);
   float temperature = dht.readTemperature();
+
+  // Timestamped after the read, not before, so the interval is measured between
+  // completed samples and cannot drift inside the sensor's own settling window.
+  lastRead = millis();
 
   char line[LCD_COLS + 1];
   char value[6];  // "-99.9" plus terminator
 
+  // A failed read shows as --.- rather than a held value, so the screen never
+  // presents a stale number as if it were current.
   if (isnan(humidity) || isnan(temperature)) {
     Serial.println(F("Temperature: --.- C   |   Humidity: --.- %   (read failed)"));
     lcdPrintLine(1, "Temp:   --.- " "\xDF" "C");
     lcdPrintLine(2, "Hum :   --.- %");
-    lcdPrintLine(3, "Sensor read failed");
     return;
   }
 
@@ -129,10 +148,4 @@ void loop() {
   dtostrf(humidity, 5, 1, value);
   snprintf(line, sizeof(line), "Hum : %s %%", value);
   lcdPrintLine(2, line);
-
-  if (humidity >= RH_SENSOR_LIMIT) {
-    lcdPrintLine(3, "RH at sensor limit");
-  } else {
-    lcdPrintLine(3, "Status: OK");
-  }
 }
